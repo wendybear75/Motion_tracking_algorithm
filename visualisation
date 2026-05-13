@@ -1,12 +1,11 @@
 import os
-import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 SUMMARY_CSV   = r"C:/Users/E123502/OneDrive - RMIT University/REVENTA data/3D estimation/displacement_results/displacement_all_patients.csv"
-OUTPUT_FOLDER = r"C:/Users/E123502/OneDrive - RMIT University/REVENTA data/3D estimation/displacement_results/lead_plots/test/"
+OUTPUT_FOLDER = r"C:/Users/E123502/OneDrive - RMIT University/REVENTA data/3D estimation/displacement_results/lead_plots/"
 
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
@@ -15,59 +14,50 @@ COLORS     = {'LR': '#4C72B0', 'SI': '#DD8452', 'AP': '#55A868'}
 
 # ── Load data ─────────────────────────────────────────────────────────────────
 df = pd.read_csv(SUMMARY_CSV)
-
-# lead_base: RV, LV, RA  (used to group figures)
-# lead_full: RV_1, RV_2  (used as the row label — kept as-is from the CSV)
 df['lead_base'] = df['lead'].str.replace(r'_\d+$', '', regex=True)
 
 lead_bases = sorted(df['lead_base'].unique())
-print(f"Lead types found: {lead_bases}\n")
+patients   = sorted(df['patient'].unique())
+print(f"Lead types found: {lead_bases}")
+print(f"Patients found:   {patients}\n")
 
-# ── One figure per lead base type ─────────────────────────────────────────────
-for lead in lead_bases:
-    df_lead = df[df['lead_base'] == lead]
+# ── Global x limit — shared across ALL figures so displacement is comparable ──
+x_max_global = {}
+for direction in DIRECTIONS:
+    vals = df[df['direction'] == direction]['values'].dropna().values
+    x_max_global[direction] = np.percentile(vals, 99) if len(vals) > 0 else 1
 
-    # Each row = unique (patient, lead_full) pair — so RV_1 and RV_2 are separate rows
-    groups = (
-        df_lead[['patient', 'lead']]
-        .drop_duplicates()
-        .sort_values(['patient', 'lead'])
-        .values.tolist()          # -> [['SYD001', 'RV_1'], ['SYD001', 'RV_2'], ...]
-    )
-    n_rows = len(groups)
 
-    fig, axes = plt.subplots(
-        nrows=n_rows, ncols=3,
-        figsize=(12, 2.5 * n_rows),
-        sharex='col', sharey=False,
-        squeeze=False,
-    )
+def plot_grid(groups_data, title, filename,
+              row_label_fn, x_max, ylabel='Displacement (mm)'):
+    """
+    Generic helper that draws a histogram grid.
 
-    fig.suptitle(f'Lead motion — {lead}', fontsize=15, fontweight='bold', y=1.01)
+    groups_data : list of (row_label, df_row) tuples
+    x_max       : dict {direction: float} — shared x limit
+    y limit     : shared WITHIN this figure only (per direction column)
+    """
+    n_rows = len(groups_data)
 
-    # ── PASS 1: compute shared limits from all data in this lead group ─────────
-    x_max = {}
-    y_max = {}
-    for direction in DIRECTIONS:
-        vals = df_lead[df_lead['direction'] == direction]['values'].dropna().values
-        x_max[direction] = np.percentile(vals, 99) if len(vals) > 0 else 1
-        y_max[direction] = 0
-
-    for patient, lead_full in groups:
-        df_row = df_lead[(df_lead['patient'] == patient) & (df_lead['lead'] == lead_full)]
+    # ── Pass 1: compute y limit from this figure's data only ──────────────────
+    y_max = {d: 0 for d in DIRECTIONS}
+    for _, df_row in groups_data:
         for direction in DIRECTIONS:
             values = df_row[df_row['direction'] == direction]['values'].dropna().values
             if len(values) == 0:
                 continue
             counts, _ = np.histogram(values, bins=30, range=(0, x_max[direction]))
-            if counts.max() > y_max[direction]:
-                y_max[direction] = counts.max()
+            y_max[direction] = max(y_max[direction], counts.max())
 
-    # ── PASS 2: draw histograms then apply finalised limits ────────────────────
-    for row, (patient, lead_full) in enumerate(groups):
-        df_row = df_lead[(df_lead['patient'] == patient) & (df_lead['lead'] == lead_full)]
-        row_label = f"{patient}\n{lead_full}"
+    # ── Pass 2: draw ───────────────────────────────────────────────────────────
+    fig, axes = plt.subplots(
+        nrows=n_rows, ncols=3,
+        figsize=(12, 2.5 * n_rows),
+        squeeze=False,
+    )
+    fig.suptitle(title, fontsize=15, fontweight='bold', y=1.01)
 
+    for row, (row_label, df_row) in enumerate(groups_data):
         for col, direction in enumerate(DIRECTIONS):
             ax = axes[row, col]
             values = df_row[df_row['direction'] == direction]['values'].dropna().values
@@ -84,181 +74,117 @@ for lead in lead_bases:
                            label=f'median={median:.1f}')
                 ax.legend(fontsize=8, frameon=False)
 
+            # x shared globally, y shared within this figure only
             ax.set_xlim(0, x_max[direction])
             ax.set_ylim(0, y_max[direction] * 1.15)
             ax.spines['top'].set_visible(False)
             ax.spines['right'].set_visible(False)
 
             if row == 0:
-                ax.set_title(direction, fontsize=12, color=COLORS[direction], fontweight='bold')
+                ax.set_title(direction, fontsize=12,
+                             color=COLORS[direction], fontweight='bold')
             if col == 0:
-                ax.set_ylabel(row_label, fontsize=9, rotation=0, labelpad=60, va='center')
+                ax.set_ylabel(row_label, fontsize=9,
+                              rotation=0, labelpad=60, va='center')
             if row == n_rows - 1:
-                ax.set_xlabel('Displacement (mm)', fontsize=10)
+                ax.set_xlabel(ylabel, fontsize=10)
 
     plt.tight_layout()
-    out_path = os.path.join(OUTPUT_FOLDER, f"lead_motion_{lead}.png")
-    plt.savefig(out_path, dpi=150, bbox_inches='tight')
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
     plt.close()
-    print(f"Saved: {out_path}")
+    print(f"Saved: {filename}")
 
-# ── Summary boxplot: grouped by lead base type (RV, LV, RA) ──────────────────
-fig, axes = plt.subplots(1, 3, figsize=(14, 5), sharey=True)
-fig.suptitle('Displacement summary — all leads', fontsize=14, fontweight='bold')
 
-for col, direction in enumerate(DIRECTIONS):
-    ax = axes[col]
-    df_dir = df[df['direction'] == direction]
+def summary_boxplot(group_labels, data_fn, title, filename, xlabel):
+    """Boxplot with sharey=True across direction panels."""
+    fig, axes = plt.subplots(1, 3, figsize=(14, 5), sharey=False)
+    fig.suptitle(title, fontsize=14, fontweight='bold')
 
-    # group by lead_base so RV_1 and RV_2 are pooled together under RV
-    data_by_lead = [df_dir[df_dir['lead_base'] == l]['values'].dropna().values for l in lead_bases]
+    for col, direction in enumerate(DIRECTIONS):
+        ax = axes[col]
+        df_dir = df[df['direction'] == direction]
+        data   = [data_fn(df_dir, label) for label in group_labels]
 
-    bp = ax.boxplot(
-        data_by_lead,
-        labels=lead_bases,
-        patch_artist=True,
-        medianprops=dict(color='black', linewidth=1.5),
-        whiskerprops=dict(linewidth=1),
-        capprops=dict(linewidth=1),
-        flierprops=dict(marker='o', markersize=3, alpha=0.4),
+        bp = ax.boxplot(
+            data, labels=group_labels, patch_artist=True,
+            medianprops=dict(color='black', linewidth=1.5),
+            whiskerprops=dict(linewidth=1),
+            capprops=dict(linewidth=1),
+            flierprops=dict(marker='o', markersize=3, alpha=0.4),
+        )
+        for patch in bp['boxes']:
+            patch.set_facecolor(COLORS[direction])
+            patch.set_alpha(0.7)
+
+        ax.set_title(direction, fontsize=12,
+                     color=COLORS[direction], fontweight='bold')
+        ax.set_xlabel(xlabel, fontsize=11)
+        ax.set_ylabel('Displacement (mm)', fontsize=11)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.tick_params(axis='x', labelsize=8, rotation=45)
+
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f"Saved: {filename}")
+
+
+# ── Per lead type ──────────────────────────────────────────────────────────────
+for lead in lead_bases:
+    df_lead = df[df['lead_base'] == lead]
+
+    groups = (
+        df_lead[['patient', 'lead']]
+        .drop_duplicates()
+        .sort_values(['patient', 'lead'])
+        .values.tolist()
     )
 
-    for patch in bp['boxes']:
-        patch.set_facecolor(COLORS[direction])
-        patch.set_alpha(0.7)
+    groups_data = [
+        (f"{pat}\n{lf}",
+         df_lead[(df_lead['patient'] == pat) & (df_lead['lead'] == lf)])
+        for pat, lf in groups
+    ]
 
-    ax.set_title(direction, fontsize=12, color=COLORS[direction], fontweight='bold')
-    ax.set_xlabel('Lead', fontsize=11)
-    ax.set_ylabel('Displacement (mm)', fontsize=11)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.tick_params(axis='x', labelsize=9)
+    plot_grid(
+        groups_data,
+        title    = f'Lead motion — {lead}',
+        filename = os.path.join(OUTPUT_FOLDER, f"lead_motion_{lead}.png"),
+        row_label_fn = None,
+        x_max    = x_max_global,
+    )
 
-plt.tight_layout()
-summary_path = os.path.join(OUTPUT_FOLDER, "lead_motion_summary_boxplot.png")
-plt.savefig(summary_path, dpi=150, bbox_inches='tight')
-plt.close()
-print(f"Saved summary boxplot: {summary_path}")
+summary_boxplot(
+    group_labels = lead_bases,
+    data_fn      = lambda df_dir, l: df_dir[df_dir['lead_base'] == l]['values'].dropna().values,
+    title        = 'Displacement summary — all leads',
+    filename     = os.path.join(OUTPUT_FOLDER, "lead_motion_summary_boxplot.png"),
+    xlabel       = 'Lead',
+)
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# One figure per patient — each row is a (lead_full, direction) combination
-# ═════════════════════════════════════════════════════════════════════════════
-# ═════════════════════════════════════════════════════════════════════════════
-# One figure per patient — each row is a lead, columns are LR/SI/AP
-# ═════════════════════════════════════════════════════════════════════════════
-patients = sorted(df['patient'].unique())
-print(f"\nPatients found: {patients}\n")
-
-# ── PASS 1: compute global shared x and y limits across ALL patients ───────────
-x_max_global = {}
-y_max_global = {}
-for direction in DIRECTIONS:
-    vals = df[df['direction'] == direction]['values'].dropna().values
-    x_max_global[direction] = np.percentile(vals, 99) if len(vals) > 0 else 1
-    y_max_global[direction] = 0
-
-for patient in patients:
-    df_pat = df[df['patient'] == patient]
-    for lead_full in df_pat['lead'].unique():
-        df_row = df_pat[df_pat['lead'] == lead_full]
-        for direction in DIRECTIONS:
-            values = df_row[df_row['direction'] == direction]['values'].dropna().values
-            if len(values) == 0:
-                continue
-            counts, _ = np.histogram(values, bins=30,
-                                     range=(0, x_max_global[direction]))
-            if counts.max() > y_max_global[direction]:
-                y_max_global[direction] = counts.max()
-
-# ── PASS 2: draw and apply the now-finalised limits ───────────────────────────
+# ── Per patient ────────────────────────────────────────────────────────────────
 for patient in patients:
     df_pat = df[df['patient'] == patient]
     leads_for_patient = sorted(df_pat['lead'].unique())
-    n_rows = len(leads_for_patient)
 
-    fig, axes = plt.subplots(
-        nrows=n_rows, ncols=3,
-        figsize=(12, 2.5 * n_rows),
-        squeeze=False,
-    )
-
-    fig.suptitle(f'Displacement — {patient}', fontsize=15, fontweight='bold', y=1.01)
-
-    for row, lead_full in enumerate(leads_for_patient):
-        df_row = df_pat[df_pat['lead'] == lead_full]
-
-        for col, direction in enumerate(DIRECTIONS):
-            ax = axes[row, col]
-            values = df_row[df_row['direction'] == direction]['values'].dropna().values
-
-            if len(values) == 0:
-                ax.text(0.5, 0.5, 'no data', ha='center', va='center',
-                        transform=ax.transAxes, fontsize=9, color='grey')
-            else:
-                ax.hist(values, bins=30,
-                        color=COLORS[direction], alpha=0.75, edgecolor='none',
-                        range=(0, x_max_global[direction]))
-                median = np.median(values)
-                ax.axvline(median, color='black', linewidth=1.2, linestyle='--',
-                           label=f'median={median:.1f}')
-                ax.legend(fontsize=8, frameon=False)
-
-            # apply uniform limits to every subplot
-            ax.set_xlim(0, x_max_global[direction])
-            ax.set_ylim(0, y_max_global[direction] * 1.15)
-            ax.spines['top'].set_visible(False)
-            ax.spines['right'].set_visible(False)
-
-            if row == 0:
-                ax.set_title(direction, fontsize=12, color=COLORS[direction], fontweight='bold')
-            if col == 0:
-                ax.set_ylabel(lead_full, fontsize=9, rotation=0, labelpad=60, va='center')
-            if row == n_rows - 1:
-                ax.set_xlabel('Displacement (mm)', fontsize=10)
-
-    plt.tight_layout()
-    out_path = os.path.join(OUTPUT_FOLDER, f"patient_motion_{patient}.png")
-    plt.savefig(out_path, dpi=150, bbox_inches='tight')
-    plt.close()
-    print(f"Saved: {out_path}")
-
-# ── Summary boxplot: grouped by patient ───────────────────────────────────────
-fig, axes = plt.subplots(1, 3, figsize=(14, 5), sharey=True)
-fig.suptitle('Displacement summary — all patients', fontsize=14, fontweight='bold')
-
-for col, direction in enumerate(DIRECTIONS):
-    ax = axes[col]
-    df_dir = df[df['direction'] == direction]
-
-    data_by_patient = [
-        df_dir[df_dir['patient'] == p]['values'].dropna().values
-        for p in patients
+    groups_data = [
+        (lead_full, df_pat[df_pat['lead'] == lead_full])
+        for lead_full in leads_for_patient
     ]
 
-    bp = ax.boxplot(
-        data_by_patient,
-        labels=patients,
-        patch_artist=True,
-        medianprops=dict(color='black', linewidth=1.5),
-        whiskerprops=dict(linewidth=1),
-        capprops=dict(linewidth=1),
-        flierprops=dict(marker='o', markersize=3, alpha=0.4),
+    plot_grid(
+        groups_data,
+        title    = f'Displacement — {patient}',
+        filename = os.path.join(OUTPUT_FOLDER, f"patient_motion_{patient}.png"),
+        row_label_fn = None,
+        x_max    = x_max_global,
     )
 
-    for patch in bp['boxes']:
-        patch.set_facecolor(COLORS[direction])
-        patch.set_alpha(0.7)
-
-    ax.set_title(direction, fontsize=12, color=COLORS[direction], fontweight='bold')
-    ax.set_xlabel('Patient', fontsize=11)
-    ax.set_ylabel('Displacement (mm)', fontsize=11)
-    ax.spines['top'].set_visible(False)
-    ax.spines['right'].set_visible(False)
-    ax.tick_params(axis='x', labelsize=8, rotation=45)
-
-plt.tight_layout()
-summary_path = os.path.join(OUTPUT_FOLDER, "patient_motion_summary_boxplot.png")
-plt.savefig(summary_path, dpi=150, bbox_inches='tight')
-plt.close()
-print(f"Saved patient summary boxplot: {summary_path}")
+summary_boxplot(
+    group_labels = patients,
+    data_fn      = lambda df_dir, p: df_dir[df_dir['patient'] == p]['values'].dropna().values,
+    title        = 'Displacement summary — all patients',
+    filename     = os.path.join(OUTPUT_FOLDER, "patient_motion_summary_boxplot.png"),
+    xlabel       = 'Patient',
+)
