@@ -1,0 +1,576 @@
+import os
+import math
+import datetime
+import pandas as pd
+from scipy.optimize import minimize
+
+
+class Convert2Dto3D:
+    def __init__(self, SAD, SID, pixelLengthAtIsocenter, XcenterPixel, YcenterPixel, isHalfFanScan, halfFanDisplacement,
+                 kvOffsetsX, kvOffsetsY, outputDirectory):
+        self._outputDirectory = outputDirectory
+        self._SAD = SAD # Usually 1000 mm
+        self._SID = SID
+        self._halfFanDisplacement = halfFanDisplacement
+        self._isHalfFanScan = isHalfFanScan # Is the scan half or full fan
+        self._pixelLengthAtIsocenter = pixelLengthAtIsocenter
+        self._xCenterPixel = XcenterPixel # The center pixel value
+        self._yCenterPixel = YcenterPixel # The center pixel value
+        self._kvOffsetsX = kvOffsetsX # An array of size 3 for the kvOffsets in X
+        self._kvOffsetsY = kvOffsetsY # An array of size 3 for the kvOffsets in Y
+
+    m_NoOfMLEestimations = 0
+    log2pi = math.log(2 * math.pi)
+    m_isMLEwithLRcorrelation = True
+    m_MLEinputSamples = None
+
+    A_init = [1, 5, 0.2, 1, 1, 1, 1]
+    B_init = [1, 1, 1, 5, 0.2, 1, 1]
+    C_init = [1, 1, 1, 1, 1, 5, 0.2]
+    D_init = [0, 0, 0, 0, 0, 0, 0]
+    E_init = [0, 0, 0, 0, 0, 0, 0]
+    F_init = [0, 0, 0, 0, 0, 0, 0]
+
+    A_init_prostate = [22.3, 1, 10]
+    B_init_prostate = [4.0, 1, 1]
+    C_init_prostate = [2.25, 1, 1]
+    F_init_prostate = [-2.28, 0, 0]
+
+    m_A, m_B, m_C, m_D, m_E, m_F, m_Xmean, m_Ymean, m_Zmean = 0, 0, 0, 0, 0, 0, 0, 0, 0
+    m_maximumEvaluations = 8000
+    _tolerance = 1e-7
+    _convergenceFailed = False
+
+    def TestHarness(self, filename, epsilon):
+        with open(filename, 'r') as reader:
+            while True:
+                line = reader.readline()
+                if not line:
+                    break
+                partsA = line.split(',')
+                ndataPoints = int(partsA[0])
+                markerLocations = [[0, 0, 0] for _ in range(ndataPoints)]
+                outputX = [0.0] * ndataPoints
+                outputY = [0.0] * ndataPoints
+                outputZ = [0.0] * ndataPoints
+                for i in range(ndataPoints):
+                    parts = None
+                    if i != 0:
+                        lineB = reader.readline()
+                        if not lineB:
+                            break
+                        parts = lineB.split(',')
+                    else:
+                        parts = [partsA[j + 1] for j in range(6)]
+                    markerLocations[i].Gantry = float(parts[0])
+                    markerLocations[i].PosX = float(parts[1])
+                    markerLocations[i].PosY = float(parts[2])
+                    outputX[i] = float(parts[3])
+                    outputY[i] = float(parts[4])
+                    outputZ[i] = float(parts[5])
+                self.Convert(markerLocations, False, os.path.splitext(os.path.basename(filename))[0])
+                for i in range(ndataPoints):
+                    mle = self.MLEsample(markerLocations[i], self._SAD, self._SID, self._isHalfFanScan, self._pixelLengthAtIsocenter,
+                                    self._xCenterPixel, self._yCenterPixel, self._halfFanDisplacement, self._kvOffsetsX, self._kvOffsetsY)
+                    position = self.EstimatePosMonoscopic(markerLocations[i].Gantry, mle.Xp, mle.Yp)
+        return True
+
+    def TestHarness2(self, markerLocation, includeLRcorrelation, outputFileStem):
+        # ── was hardcoded; now uses outputDirectory + outputFileStem ──────────
+        cOutputPath = os.path.join(self._outputDirectory, f"cOutput_{outputFileStem}.txt")
+
+        with open(cOutputPath, 'w') as writer:
+            writer.write("Gantry, Time, PosX, PosY, X, Y, Z\n")
+            for k in range(len(markerLocation), len(markerLocation)+1):
+                markerLocations = markerLocation[:k]
+                self.Convert(markerLocations, includeLRcorrelation, outputFileStem)
+
+                for i in range(len(markerLocations)):
+                    mle = self.MLEsample(markerLocations.iloc[i], self._SAD, self._SID, self._isHalfFanScan, self._pixelLengthAtIsocenter,
+                                                            self._xCenterPixel, self._yCenterPixel, self._halfFanDisplacement, self._kvOffsetsX, self._kvOffsetsY)
+                    position = self.EstimatePosMonoscopic(markerLocations.iloc[i].Gantry, mle.Xp, mle.Yp)
+
+                    writer.write(str(markerLocations.iloc[i].Gantry) + "," + str(markerLocations.iloc[i].Time)
+                                 + "," + str(markerLocations.iloc[i].PosX) + "," + str(
+                                markerLocations.iloc[i].PosY) + "," + str(position[0]) + "," + str(position[1]) + "," + str(
+                                position[2]) + "\n")
+        return True
+
+    def Convert(self, markerLocation, includeLRcorrelation, outputFileStem):
+        start = datetime.datetime.now()
+        self.m_isMLEwithLRcorrelation = includeLRcorrelation
+
+        # Get input 2D coordinates
+        m_MLEinputSamples = []
+        for i in range(len(markerLocation)):
+            m_MLEinputSamples.append(self.MLEsample(markerLocation.iloc[i], self._SAD, self._SID, self._isHalfFanScan,
+                                                    self._pixelLengthAtIsocenter, self._xCenterPixel,
+                                                    self._yCenterPixel, self._halfFanDisplacement, self._kvOffsetsX,
+                                                    self._kvOffsetsY))
+        self.m_MLEinputSamples = m_MLEinputSamples
+
+        # Calculate covariance matrix parameters in two conditions
+        if self.m_isMLEwithLRcorrelation: # consider LR motion
+            self.MLEestimatePDF_incl_LRcorr()
+        else:
+            self.MLEestimatePDF_excl_LRcorr()
+
+        determinantB = self.m_A * (self.m_B * self.m_C - self.m_F * self.m_F / 4)
+        varX = (self.m_B * self.m_C - self.m_F * self.m_F / 4) / determinantB
+        varY = self.m_A * self.m_C / determinantB
+        varZ = self.m_A * self.m_B / determinantB
+        covXY = -(self.m_C * self.m_D / 2 - self.m_E * self.m_F / 4) / determinantB
+        covXZ = -(self.m_D * self.m_F / 4 - self.m_B * self.m_E / 2) / determinantB
+        covYZ = -(self.m_A * self.m_F / 2 - self.m_D * self.m_E / 4) / determinantB
+
+        # ── was hardcoded; now uses outputDirectory + outputFileStem ──────────
+        covarianceFile = os.path.join(self._outputDirectory, f"covOutput_{outputFileStem}.txt")
+        writeHeader = (not os.path.exists(covarianceFile))
+        try:
+            with open(covarianceFile, "w") as covWriter:
+                if writeHeader:
+                    covWriter.write("frameNo, pdfLength, varX, varY, varZ, covXY, covXZ, covYZ\n")
+                if len(markerLocation) > 0:
+                    covWriter.write("{0:.4f}, {1:.4f}, {2:.4f}, {3:.4f}, {4:.4f}, {5:.4f}, {6:.4f}, {7:.4f}\n".format(len(markerLocation), len(markerLocation), varX, varY, varZ, covXY, covXZ, covYZ))
+                    covWriter.flush()
+        except IOError:
+            pass
+
+        print("A= " + str(self.m_A) + " B= " + str(self.m_B) + " C=" + str(self.m_C) + " D=" + str(self.m_D) + " E=" + str(self.m_E) + " F=" + str(self.m_F) + " XB=" + str(self.m_Xmean) + " YB=" + str(self.m_Ymean) + " ZB=" + str(self.m_Zmean))
+        elapsed = (datetime.datetime.now() - start).total_seconds() * 1000
+
+        return varX, varY, varZ, covXY, covXZ, covYZ
+
+    # USE THIS METHOD when LR motion is included in the MLE optimization (typical lung/abdomen)
+    def MLEestimatePDF_incl_LRcorr(self):
+        initialGuess_LsqrMeanPos = [0, 0, 0]
+        initialGuess_MLE = [0, 0, 0, 0, 0, 0, 0, 0, 0]
+        iterations = 0
+        evaluations = 0
+        gradientEvaluations = 0
+
+        # Nelder-Mead simplex Least Square estimation to find the estimated mean postion (3D) of the marker
+        if self.m_NoOfMLEestimations < 1: # First MLE optimization
+            nm_LsqrMeanPos = minimize(self.f_LSqr, initialGuess_LsqrMeanPos, method='Nelder-Mead')
+            initialGuess_MLE[0] = nm_LsqrMeanPos.x[0]
+            initialGuess_MLE[1] = nm_LsqrMeanPos.x[1]
+            initialGuess_MLE[2] = nm_LsqrMeanPos.x[2]
+        else: # MLE optimization has been performed previously, use previous MLE optimized mean position as initial guess
+            initialGuess_MLE[0] = self.m_Xmean
+            initialGuess_MLE[1] = self.m_Ymean
+            initialGuess_MLE[2] = self.m_Zmean
+
+        initialGuess_MLE[3] = self.m_A
+        initialGuess_MLE[4] = self.m_B
+        initialGuess_MLE[5] = self.m_C
+        initialGuess_MLE[6] = self.m_D
+        initialGuess_MLE[7] = self.m_E
+        initialGuess_MLE[8] = self.m_F
+        print(initialGuess_MLE)
+
+        # Conjugate gradient algorithm (method='CG'), self.f_MLE is objective function, self.g_MLE is derivative of objective function
+        cg_PPR = minimize(self.f_MLE, initialGuess_MLE, method='CG', jac=self.g_MLE, tol=self._tolerance)
+
+        iterations += cg_PPR.nit
+        evaluations += cg_PPR.nfev
+        gradientEvaluations += cg_PPR.njev
+
+        objFctMinimum = self.f_MLE(cg_PPR.x)
+        self.m_Xmean = cg_PPR.x[0]
+        self.m_Ymean = cg_PPR.x[1]
+        self.m_Zmean = cg_PPR.x[2]
+        self.m_A = cg_PPR.x[3]
+        self.m_B = cg_PPR.x[4]
+        self.m_C = cg_PPR.x[5]
+        self.m_D = cg_PPR.x[6]
+        self.m_E = cg_PPR.x[7]
+        self.m_F = cg_PPR.x[8]
+
+        if self.m_NoOfMLEestimations < 1 or self.imageCost(len(self.m_MLEinputSamples)) > 10:
+            indexOfBestInitMatrix = -1
+            for i in range(len(self.A_init)):
+                initialGuess_MLE[3] = self.A_init[i]
+                initialGuess_MLE[4] = self.B_init[i]
+                initialGuess_MLE[5] = self.C_init[i]
+                initialGuess_MLE[6] = self.D_init[i]
+                initialGuess_MLE[7] = self.E_init[i]
+                initialGuess_MLE[8] = self.F_init[i]
+
+                cg_PPR = minimize(self.f_MLE, initialGuess_MLE, method='CG', jac=self.g_MLE)
+                iterations += cg_PPR.nit
+                evaluations += cg_PPR.nfev
+                gradientEvaluations += cg_PPR.njev
+
+                if self.f_MLE(cg_PPR.x) < objFctMinimum:
+                    indexOfBestInitMatrix = i
+                    objFctMinimum = self.f_MLE(cg_PPR.x)
+                    self.m_Xmean = cg_PPR.x[0]
+                    self.m_Ymean = cg_PPR.x[1]
+                    self.m_Zmean = cg_PPR.x[2]
+                    self.m_A = cg_PPR.x[3]
+                    self.m_B = cg_PPR.x[4]
+                    self.m_C = cg_PPR.x[5]
+                    self.m_D = cg_PPR.x[6]
+                    self.m_E = cg_PPR.x[7]
+                    self.m_F = cg_PPR.x[8]
+
+            print(f"Extended search: Lowest min found for i: {indexOfBestInitMatrix}")
+
+        self.m_NoOfMLEestimations += 1
+
+    # USE THIS METHOD when LR motion is not included in the MLE optimization (typical prostate)
+    def MLEestimatePDF_excl_LRcorr(self):
+        initialGuess_LsqrMeanPos = [0, 0, 0]
+        initialGuess_MLE = [0, 0, 0, 0, 0, 0, 0]
+        iterations = 0
+        evaluations = 0
+        gradientEvaluations = 0
+
+        if self.m_NoOfMLEestimations < 1:
+            nm_LsqrMeanPos = minimize(self.f_LSqr, initialGuess_LsqrMeanPos, method='Nelder-Mead', tol=self._tolerance, options={'maxiter':self.m_maximumEvaluations})
+            initialGuess_MLE[0] = nm_LsqrMeanPos.x[0]
+            initialGuess_MLE[1] = nm_LsqrMeanPos.x[1]
+            initialGuess_MLE[2] = nm_LsqrMeanPos.x[2]
+        else:
+            initialGuess_MLE[0] = self.m_Xmean
+            initialGuess_MLE[1] = self.m_Ymean
+            initialGuess_MLE[2] = self.m_Zmean
+
+        initialGuess_MLE[3] = self.m_A
+        initialGuess_MLE[4] = self.m_B
+        initialGuess_MLE[5] = self.m_C
+        initialGuess_MLE[6] = self.m_F
+
+        cg_PPR = minimize(self.f_MLE, initialGuess_MLE, method='CG', jac=self.g_MLE, tol=self._tolerance, options={'maxiter': self.m_maximumEvaluations})
+
+        iterations += cg_PPR.nit
+        evaluations += cg_PPR.nfev
+        gradientEvaluations += cg_PPR.njev
+
+        objFctMinimum = self.f_MLE(cg_PPR.x)
+        self.m_Xmean = cg_PPR.x[0]
+        self.m_Ymean = cg_PPR.x[1]
+        self.m_Zmean = cg_PPR.x[2]
+        self.m_A = cg_PPR.x[3]
+        self.m_B = cg_PPR.x[4]
+        self.m_C = cg_PPR.x[5]
+        self.m_D = 0
+        self.m_E = 0
+        self.m_F = cg_PPR.x[6]
+
+        if self.m_NoOfMLEestimations < 1 or self.imageCost(len(self.m_MLEinputSamples)) > 5:
+            for i in range(len(self.A_init_prostate)):
+                initialGuess_MLE[3] = self.A_init_prostate[i]
+                initialGuess_MLE[4] = self.B_init_prostate[i]
+                initialGuess_MLE[5] = self.C_init_prostate[i]
+                initialGuess_MLE[6] = self.F_init_prostate[i]
+
+                cg_PPR = minimize(self.f_MLE, initialGuess_MLE, method='CG', jac=self.g_MLE, tol=self._tolerance)
+                iterations += cg_PPR.nit
+                evaluations += cg_PPR.nfev
+                gradientEvaluations += cg_PPR.njev
+
+                if self.f_MLE(cg_PPR.x) < objFctMinimum:
+                    indexOfBestInitMatrix = i
+                    objFctMinimum = self.f_MLE(cg_PPR.x)
+                    self.m_Xmean = cg_PPR.x[0]
+                    self.m_Ymean = cg_PPR.x[1]
+                    self.m_Zmean = cg_PPR.x[2]
+                    self.m_A = cg_PPR.x[3]
+                    self.m_B = cg_PPR.x[4]
+                    self.m_C = cg_PPR.x[5]
+                    self.m_D = 0
+                    self.m_E = 0
+                    self.m_F = cg_PPR.x[6]
+
+        self.m_NoOfMLEestimations += 1
+
+    def CheckStatus(self, status):
+        if status == 'Converged' or status == 'EvaluationLimitExceeded':
+            self._convergenceFailed = False
+        else:
+            self._convergenceFailed = True
+
+    def EstimatePosMonoscopic(self, gantryAngle, xp, yp):
+        viewAngleRad = gantryAngle * math.pi / 180.0
+        cosViewAngle = math.cos(viewAngleRad)
+        sinViewAngle = math.sin(viewAngleRad)
+
+        Arot = self.m_A * cosViewAngle * cosViewAngle + self.m_C * sinViewAngle * sinViewAngle - self.m_E * sinViewAngle * cosViewAngle
+        Brot = self.m_B
+        Crot = self.m_A * sinViewAngle * sinViewAngle + self.m_C * cosViewAngle * cosViewAngle + self.m_E * sinViewAngle * cosViewAngle
+        Drot = self.m_D * cosViewAngle - self.m_F * sinViewAngle
+        Erot = (self.m_A - self.m_C) * math.sin(2 * viewAngleRad) + self.m_E * math.cos(2 * viewAngleRad)
+        Frot = self.m_D * sinViewAngle + self.m_F * cosViewAngle
+
+        deltaXrot = self.m_Xmean * cosViewAngle - self.m_Zmean * sinViewAngle
+        deltaYrot = self.m_Ymean
+        deltaZrot = self.m_Xmean * sinViewAngle + self.m_Zmean * cosViewAngle
+
+        sigma = self._SAD / math.sqrt((Arot * xp + Drot * yp - self._SAD * Erot) * xp + (Brot * yp - self._SAD * Frot) * yp + self._SAD * self._SAD * Crot)
+        my = sigma * sigma * (Arot * xp * (xp - deltaXrot) / self._SAD + Brot * yp * (yp - deltaYrot) / self._SAD + Crot * deltaZrot + Drot * (xp * (yp - deltaYrot) + (xp - deltaXrot) * yp) / self._SAD / 2 - Erot * (xp - deltaXrot + xp * deltaZrot / self._SAD) / 2 - Frot * (yp - deltaYrot + yp * deltaZrot / self._SAD) / 2)
+
+        scaleFactor = (self._SAD - my) / self._SAD
+        X = xp * scaleFactor * cosViewAngle + my * sinViewAngle
+        Y = yp * scaleFactor
+        Z = -xp * scaleFactor * sinViewAngle + my * cosViewAngle
+
+        return [X, Y, Z]
+
+    def f_LSqr(self, pos):
+        Xmean = pos[0]
+        Ymean = pos[1]
+        Zmean = pos[2]
+        sqrSum = 0
+        for i in range(len(self.m_MLEinputSamples)):
+            scaleFactor = self._SAD / (self._SAD - self.m_MLEinputSamples[i].SinAngle * Xmean - self.m_MLEinputSamples[i].CosAngle * Zmean)
+            XpForGuess = (self.m_MLEinputSamples[i].CosAngle * Xmean - self.m_MLEinputSamples[i].SinAngle * Zmean) * scaleFactor
+            YpForGuess = Ymean * scaleFactor
+            sqrSum += (XpForGuess - self.m_MLEinputSamples[i].Xp) ** 2 + (YpForGuess - self.m_MLEinputSamples[i].Yp) ** 2
+        return sqrSum
+
+    def f_MLE(self, covPos):
+        Xmean, Ymean, Zmean, A, B, C = covPos[0], covPos[1], covPos[2], covPos[3], covPos[4], covPos[5]
+
+        if self.m_isMLEwithLRcorrelation:
+            D, E, F = covPos[6], covPos[7], covPos[8]
+        else:
+            D, E, F = 0, 0, covPos[6]
+
+        determinantB = A * (B * C - F * F / 4) - D / 2 * (D * C / 2 - E * F / 4) + E / 2 * (D * F / 4 - B * E / 2)
+
+        if (determinantB <= 0) or (A * B <= D ** 2 / 4) or (A <= 0):
+            return 1000000000000000
+        else:
+            minusLogProbabilityProduct = len(self.m_MLEinputSamples) * math.log(2 * math.pi)
+            for i in range(len(self.m_MLEinputSamples)):
+                Fx = self.m_MLEinputSamples[i].Fx
+                Fy = self.m_MLEinputSamples[i].Fy
+                Fz = self.m_MLEinputSamples[i].Fz
+                Mx = -(self.m_MLEinputSamples[i].Xp * self.m_MLEinputSamples[i].CosAngle - Xmean)
+                My = -(self.m_MLEinputSamples[i].Yp - Ymean)
+                Mz = -(-self.m_MLEinputSamples[i].Xp * self.m_MLEinputSamples[i].SinAngle - Zmean)
+                Xp = self.m_MLEinputSamples[i].Xp
+                Yp = self.m_MLEinputSamples[i].Yp
+                sqrtDeterminantB = math.sqrt(determinantB)
+
+                if self.m_isMLEwithLRcorrelation:
+                    sigma = self._SAD / math.sqrt((A * Fx + D * Fy + E * Fz) * Fx + (B * Fy + F * Fz) * Fy + C * Fz * Fz)
+                    myOVERsigma = sigma * (A * Fx * Mx + B * Fy * My + C * Fz * Mz + D / 2 * (Fx * My + Fy * Mx) + E / 2 * (Fx * Mz + Fz * Mx) + F / 2 * (Fz * My + Fy * Mz)) / self._SAD
+                    minusLogProbabilityProduct -= (math.log(sqrtDeterminantB * sigma) - 0.5 * ((A * Mx + D * My + E * Mz) * Mx + (B * My + F * Mz) * My + C * Mz * Mz - myOVERsigma * myOVERsigma))
+                else:
+                    sigma = self._SAD / math.sqrt(A * Fx * Fx + (B * Fy + F * Fz) * Fy + C * Fz * Fz)
+                    myOVERsigma = sigma * (A * Fx * Mx + B * Fy * My + C * Fz * Mz + F / 2 * (Fz * My + Fy * Mz)) / self._SAD
+                    minusLogProbabilityProduct -= (math.log(sqrtDeterminantB * sigma) - 0.5 * (A * Mx * Mx + (B * My + F * Mz) * My + C * Mz * Mz - myOVERsigma * myOVERsigma))
+
+            return minusLogProbabilityProduct
+
+    def imageCost(self, imageNumber):
+        try:
+            determinantB = self.m_A * (self.m_B * self.m_C - self.m_F * self.m_F / 4) - self.m_D / 2 * (self.m_D * self.m_C / 2 - self.m_E * self.m_F / 4) + self.m_E / 2 * (self.m_D * self.m_F / 4 - self.m_B * self.m_E / 2)
+
+            if (determinantB <= 0) or (self.m_A * self.m_B <= self.m_D * self.m_D / 4) or (self.m_A <= 0):
+                return 1000000000000000
+            else:
+                currentMLEsample = self.m_MLEinputSamples[imageNumber - 1]
+                Fx = currentMLEsample.Fx
+                Fy = currentMLEsample.Fy
+                Fz = currentMLEsample.Fz
+                Mx = -(currentMLEsample.Xp * currentMLEsample.CosAngle - self.m_Xmean)
+                My = -(currentMLEsample.Yp - self.m_Ymean)
+                Mz = -(-currentMLEsample.Xp * currentMLEsample.SinAngle - self.m_Zmean)
+                Xp = currentMLEsample.Xp
+                Yp = currentMLEsample.Yp
+                sqrtDeterminantB = math.sqrt(determinantB)
+
+                if self.m_isMLEwithLRcorrelation:
+                    sigma = self._SAD / math.sqrt((self.m_A * Fx + self.m_D * Fy + self.m_E * Fz) * Fx + (self.m_B * Fy + self.m_F * Fz) * Fy + self.m_C * Fz * Fz)
+                    myOVERsigma = sigma * (self.m_A * Fx * Mx + self.m_B * Fy * My + self.m_C * Fz * Mz + self.m_D / 2 * (Fx * My + Fy * Mx) + self.m_E / 2 * (Fx * Mz + Fz * Mx) + self.m_F / 2 * (Fz * My + Fy * Mz)) / self._SAD
+                    minusLogProbability = -(math.log(sqrtDeterminantB * sigma) - math.log(2 * math.pi) - 0.5 * ((self.m_A * Mx + self.m_D * My + self.m_E * Mz) * Mx + (self.m_B * My + self.m_F * Mz) * My + self.m_C * Mz * Mz - myOVERsigma * myOVERsigma))
+                else:
+                    sigma = self._SAD / math.sqrt(self.m_A * Fx * Fx + (self.m_B * Fy + self.m_F * Fz) * Fy + self.m_C * Fz * Fz)
+                    myOVERsigma = sigma * (self.m_A * Fx * Mx + self.m_B * Fy * My + self.m_C * Fz * Mz + self.m_F / 2 * (Fz * My + Fy * Mz)) / self._SAD
+                    minusLogProbability = -(math.log(sqrtDeterminantB * sigma) - math.log(2 * math.pi) - 0.5 * (self.m_A * Mx * Mx + (self.m_B * My + self.m_F * Mz) * My + self.m_C * Mz * Mz - myOVERsigma * myOVERsigma))
+                return minusLogProbability
+        except:
+            return 1000000000000000
+
+    def g_MLE(self, covPos):
+        if self.m_isMLEwithLRcorrelation:
+            f = [0] * 9
+        else:
+            f = [0] * 7
+
+        Xmean, Ymean, Zmean, A, B, C = covPos[0], covPos[1], covPos[2], covPos[3], covPos[4], covPos[5]
+
+        if self.m_isMLEwithLRcorrelation:
+            D, E, F = covPos[6], covPos[7], covPos[8]
+        else:
+            D, E, F = 0, 0, covPos[6]
+
+        determinantB = A * (B * C - F * F / 4) - D / 2 * (D * C / 2 - E * F / 4) + E / 2 * (D * F / 4 - B * E / 2)
+
+        if (determinantB > 0) and (A * B > D ** 2 / 4) and (A > 0):
+            derivXmean = 0
+            derivYmean = 0
+            derivZmean = 0
+            derivA = 0
+            derivB = 0
+            derivC = 0
+            derivD = 0
+            derivE = 0
+            derivF = 0
+            for i in range(len(self.m_MLEinputSamples)):
+                Fx = self.m_MLEinputSamples[i].Fx
+                Fy = self.m_MLEinputSamples[i].Fy
+                Fz = self.m_MLEinputSamples[i].Fz
+                Mx = -(self.m_MLEinputSamples[i].Xp * self.m_MLEinputSamples[i].CosAngle - Xmean)
+                My = -(self.m_MLEinputSamples[i].Yp - Ymean)
+                Mz = -(-self.m_MLEinputSamples[i].Xp * self.m_MLEinputSamples[i].SinAngle - Zmean)
+
+                if self.m_isMLEwithLRcorrelation:
+                    sigmaOverSADsquared = 1 / ((A * Fx + D * Fy + E * Fz) * Fx + (B * Fy + F * Fz) * Fy + C * Fz * Fz)
+                    myOverSAD = sigmaOverSADsquared * (A * Fx * Mx + B * Fy * My + C * Fz * Mz + D / 2 * (Fx * My + Fy * Mx) + E / 2 * (Fx * Mz + Fz * Mx) + F / 2 * (Fz * My + Fy * Mz))
+                    derivXmean += A * Mx + 0.5 * (D * My + E * Mz - myOverSAD * (2 * A * Fx + D * Fy + E * Fz))
+                    derivYmean += B * My + 0.5 * (D * Mx + F * Mz - myOverSAD * (2 * B * Fy + D * Fx + F * Fz))
+                    derivZmean += C * Mz + 0.5 * (E * Mx + F * My - myOverSAD * (2 * C * Fz + E * Fx + F * Fy))
+                    derivA += 0.5 * ((F * F / 4 - B * C) / determinantB + Mx * Mx + (sigmaOverSADsquared + myOverSAD * myOverSAD) * Fx * Fx) - myOverSAD * Fx * Mx
+                    derivB += 0.5 * ((E * E / 4 - A * C) / determinantB + My * My + (sigmaOverSADsquared + myOverSAD * myOverSAD) * Fy * Fy) - myOverSAD * Fy * My
+                    derivC += 0.5 * ((D * D / 4 - A * B) / determinantB + Mz * Mz + (sigmaOverSADsquared + myOverSAD * myOverSAD) * Fz * Fz) - myOverSAD * Fz * Mz
+                    derivD += 0.5 * ((D * C / 2 - E * F / 4) / determinantB + Mx * My + (sigmaOverSADsquared + myOverSAD * myOverSAD) * Fx * Fy - myOverSAD * (Fx * My + Fy * Mx))
+                    derivE += 0.5 * ((B * E / 2 - D * F / 4) / determinantB + Mx * Mz + (sigmaOverSADsquared + myOverSAD * myOverSAD) * Fx * Fz - myOverSAD * (Fx * Mz + Fz * Mx))
+                    derivF += 0.5 * ((A * F / 2 - D * E / 4) / determinantB + My * Mz + (sigmaOverSADsquared + myOverSAD * myOverSAD) * Fy * Fz - myOverSAD * (Fy * Mz + Fz * My))
+                else:
+                    sigmaOverSADsquared = 1 / (A * Fx * Fx + (B * Fy + F * Fz) * Fy + C * Fz * Fz)
+                    myOverSAD = sigmaOverSADsquared * (A * Fx * Mx + B * Fy * My + C * Fz * Mz + F / 2 * (Fz * My + Fy * Mz))
+                    derivXmean += A * Mx + 0.5 * (-myOverSAD * (2 * A * Fx))
+                    derivYmean += B * My + 0.5 * (F * Mz - myOverSAD * (2 * B * Fy + F * Fz))
+                    derivZmean += C * Mz + 0.5 * (F * My - myOverSAD * (2 * C * Fz + F * Fy))
+                    derivA += 0.5 * ((F * F / 4 - B * C) / determinantB + Mx * Mx + (sigmaOverSADsquared + myOverSAD * myOverSAD) * Fx * Fx) - myOverSAD * Fx * Mx
+                    derivB += 0.5 * ((-A * C) / determinantB + My * My + (sigmaOverSADsquared + myOverSAD * myOverSAD) * Fy * Fy) - myOverSAD * Fy * My
+                    derivC += 0.5 * ((-A * B) / determinantB + Mz * Mz + (sigmaOverSADsquared + myOverSAD * myOverSAD) * Fz * Fz) - myOverSAD * Fz * Mz
+                    derivF += 0.5 * ((A * F / 2) / determinantB + My * Mz + (sigmaOverSADsquared + myOverSAD * myOverSAD) * Fy * Fz - myOverSAD * (Fy * Mz + Fz * My))
+
+            f[0] = derivXmean
+            f[1] = derivYmean
+            f[2] = derivZmean
+            f[3] = derivA
+            f[4] = derivB
+            f[5] = derivC
+            if self.m_isMLEwithLRcorrelation:
+                f[6] = derivD
+                f[7] = derivE
+                f[8] = derivF
+            else:
+                f[6] = derivF
+
+        return f
+
+    class MLEsample:
+        @staticmethod
+        def XKVOffset(kVOffsetX, viewAngle, isHalfFanScan, halfFanDisplacement, pixelLengthAtIsocenter, SID, SAD):
+            return kVOffsetX[0] + kVOffsetX[1] * math.sin((180 - (viewAngle + 90) + kVOffsetX[2]) * math.pi / 180) - (halfFanDisplacement / (pixelLengthAtIsocenter * SID / SAD) if isHalfFanScan else 0)
+
+        @staticmethod
+        def YKVOffset(kVOffsetX, viewAngle):
+            return kVOffsetX[0] + kVOffsetX[1] * math.sin((180 - (viewAngle + 90) + kVOffsetX[2]) * math.pi / 180)
+
+        def __init__(self, marker, SAD, SID, isHalfFanScan, pixelLengthAtIsocenter, xCenterPixel, yCenterPixel, halfFanDisplacement, kVOffSetsX, kvOffSetsY):
+            markerPixelX = marker.PosX
+            markerPixelY = marker.PosY
+            viewAngle = marker.Gantry
+
+            kVoffsetX = marker.ElektaKVOffsetX if marker.ElektaKVOffsetX != 0 else self.XKVOffset(kVOffSetsX, viewAngle,
+                                                                                                  isHalfFanScan,
+                                                                                                  halfFanDisplacement,
+                                                                                                  pixelLengthAtIsocenter,
+                                                                                                  SID, SAD)
+            kVoffsetY = marker.ElektaKVOffsetY if marker.ElektaKVOffsetY != 0 else self.YKVOffset(kvOffSetsY, viewAngle)
+
+            self._Xp = pixelLengthAtIsocenter * (markerPixelX - xCenterPixel - kVoffsetX/0.8)
+            self._Yp = -pixelLengthAtIsocenter * (markerPixelY - yCenterPixel - kVoffsetY/0.8)
+            self._ViewAngle = viewAngle
+            self._SinAngle = math.sin(viewAngle * math.pi / 180.0)
+            self._CosAngle = math.cos(viewAngle * math.pi / 180.0)
+
+            self.Fx = SAD * self.SinAngle - self.Xp * self.CosAngle
+            self.Fy = -self.Yp
+            self.Fz = SAD * self.CosAngle + self.Xp * self.SinAngle
+
+        @property
+        def Xp(self):
+            return self._Xp
+
+        @Xp.setter
+        def Xp(self, value):
+            self._Xp = value
+
+        @property
+        def Yp(self):
+            return self._Yp
+
+        @Yp.setter
+        def Yp(self, value):
+            self._Yp = value
+
+        @property
+        def ViewAngle(self):
+            return self._ViewAngle
+
+        @ViewAngle.setter
+        def ViewAngle(self, value):
+            self._ViewAngle = value
+
+        @property
+        def SinAngle(self):
+            return self._SinAngle
+
+        @SinAngle.setter
+        def SinAngle(self, value):
+            self._SinAngle = value
+
+        @property
+        def CosAngle(self):
+            return self._CosAngle
+
+        @CosAngle.setter
+        def CosAngle(self, value):
+            self._CosAngle = value
+
+        def __str__(self):
+            return f"Xp: {self.Xp}, Yp: {self.Yp}, ViewAngle: {self.ViewAngle}, SinAngle: {self.SinAngle}, CosAngle: {self.CosAngle}, Fx: {self.Fx}, Fy: {self.Fy}, Fz: {self.Fz}"
+
+
+if __name__ == '__main__':
+    ANNOTATION_FOLDER = r"C:/Users/E123502/OneDrive - RMIT University/REVENTA data/manual annotations/"
+    OUTPUT_FOLDER     = r"C:/Users/E123502/OneDrive - RMIT University/REVENTA data/3D estimation/manual_batch_output"
+
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    for filename in sorted(f for f in os.listdir(ANNOTATION_FOLDER) if f.lower().endswith(".csv")):
+        filepath = os.path.join(ANNOTATION_FOLDER, filename)
+        stem = os.path.splitext(filename)[0]   
+
+        print(f"Processing: {filename}")
+
+        data = pd.read_csv(filepath)
+        select_data = data.dropna()
+
+        marker_angle_modi = [item + 90 for item in select_data.Gantry.tolist()]
+
+        input_data = pd.DataFrame({
+            'Time':            select_data.Timestamp,
+            'PosX':            select_data.PosX.tolist(),
+            'PosY':            select_data.PosY.tolist(),
+            'Gantry':          marker_angle_modi,
+            'ElektaKVOffsetX': select_data.ElektaKVOffsetX.tolist(),
+            'ElektaKVOffsetY': select_data.ElektaKVOffsetY.tolist(),
+        })
+
+        converter = Convert2Dto3D(
+            1000, 1536, 0.5208, 256, 256, True, 142,
+            [0, 0, 0], [0, 0, 0],
+            OUTPUT_FOLDER,
+        )
+
+        converter.TestHarness2(input_data, True, stem)
