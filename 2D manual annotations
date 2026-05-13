@@ -1,0 +1,520 @@
+import json
+import os
+import struct
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from xml.dom import minidom
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  GLOBAL CONFIG
+# ══════════════════════════════════════════════════════════════════════════════
+BASE_DIR  = Path("C:/Users/E123502/OneDrive - RMIT University/REVENTA data")
+ANNOT_DIR = BASE_DIR / "manual annotations"
+SMALL_DIR = ANNOT_DIR / "small images"
+PROJ_DIR  = ANNOT_DIR / "projected"
+PLOT_DIR  = ANNOT_DIR / "plots"
+
+IMAGE_SIZE = 512
+HALF_CROP  = 35      # crop window = 70×70 px
+SHIFT      = 0       # vertical shift applied to crop centre
+YEAR_TAG   = "2027"  # used in Part 2 index CSV filenames 
+
+
+# ── Scanner geometry ───────────────────────────────────────────────────────────
+class accelerator:
+    SID = 1536
+    SAD = 1000
+    XCenterPixel = 256
+    YCenterPixel = 256
+    PixelLengthAtDetector  = 0.8
+    PixelLengthAtIsocenter = PixelLengthAtDetector * SAD / SID
+
+
+# ── Lead plot colours (suffix-aware; falls back to lead type) ──────────────────────
+LEAD_COLORS = {
+    "RA":   "k",
+    "RV":   "C0",
+    "RV_1": "C0",
+    "RV_2": "C1",
+    "RV_3": "C4",
+    "LV":   "C2",
+    "LV_1": "C2",
+    "LV_2": "C5",
+}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MASTER CONFIG  — one entry per patient/scan
+#  Fields:
+#    patient_id  : "SYD001" …
+#    scan_id     : "CBCT1" …
+#    ann_prefix  : short label used in output filenames ("P1", "P4" …)
+#    leads       : lead suffixes that have COCO annotations
+#    point       : (x, y, z) lead tip in patient/DICOM space
+#    isocenter   : (x, y, z) isocentre in patient/DICOM space
+# ══════════════════════════════════════════════════════════════════════════════
+CONFIGS = [
+    {
+        "patient_id": "SYD001", "scan_id": "CBCT1", "ann_prefix": "P1",
+        "leads": ["RA", "RV"],
+        "point": (55.2, 0.5, -604.09), "isocenter": (60.9, 34.0, -583.1),
+    },
+    {
+        "patient_id": "SYD002", "scan_id": "CBCT3", "ann_prefix": "P2",
+        "leads": ["RA", "RV"],
+        "point": (53.5, -71.7, -692.49), "isocenter": (43.8, 16.4, -670),
+    },
+    {
+        "patient_id": "SYD003", "scan_id": "CBCT3", "ann_prefix": "P3",
+        "leads": ["RV_1", "RV_2", "RV_3"],
+        "point": (35.7, -37.2, -315.79), "isocenter": (12.9, 26.1, -312.8),
+    },
+    {
+        "patient_id": "SYD004", "scan_id": "CBCT3", "ann_prefix": "P4",
+        "leads": ["RV_1", "RV_2"],
+        "point": (63.9, -11.3, -735.6), "isocenter": (62.5, 66.6, -735.6),
+    },
+    {
+        "patient_id": "SYD005", "scan_id": "CBCT1", "ann_prefix": "P5",
+        "leads": ["RV"],
+        "point": (82, -298.8, -701.4), "isocenter": (51.3, -226.1, -665.0),
+    },
+    {
+        "patient_id": "SYD006", "scan_id": "CBCT1", "ann_prefix": "P6",
+        "leads": ["RA", "RV", "LV_1", "LV_2"],
+        "point": (84.79, -78.6, -1403.5), "isocenter": (117.8, -64.7, -1377.5),
+    },
+    {
+        "patient_id": "SYD007", "scan_id": "CBCT1", "ann_prefix": "P7",
+        "leads": ["RA", "RV", "LV_1", "LV_2"],
+        "point": (69.3, -37.5, -1337.1), "isocenter": (78, 5, -1283.5),
+    },
+    {
+        "patient_id": "SYD008", "scan_id": "CBCT1", "ann_prefix": "P8",
+        "leads": ["RA", "LV_1", "LV_2"],
+        "point": None, "isocenter": None,   # ← fill in when available
+    },
+    {
+        "patient_id": "SYD009", "scan_id": "CBCT2", "ann_prefix": "P9",
+        "leads": ["RA", "RV"],
+        "point": (53.9, -106.1, -1254.5), "isocenter": (51.5, -76.2, -1227.5),
+    },
+    {
+        "patient_id": "SYD010", "scan_id": "CBCT2", "ann_prefix": "P10",
+        "leads": ["RA", "RV"],
+        "point": (86.9, -375, -266.1), "isocenter": (64.9, -342, -251.9),
+    },
+    {
+        "patient_id": "SYD011", "scan_id": "CBCT2", "ann_prefix": "P11",
+        "leads": ["RA", "RV_1", "RV_2"],
+        "point": (70.8, -16.5, -706.5), "isocenter": (53.2, 21.8, -694.5),
+    },
+    # ── Add new patients below ────────────────────────────────────────────────
+    # {
+    #     "patient_id": "SYD012", "scan_id": "CBCT1", "ann_prefix": "P12",
+    #     "leads": ["RA", "RV"],
+    #     "point": (x, y, z), "isocenter": (x, y, z),
+    # },
+]
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PATH HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def _scan_num(scan_id):
+    return "".join(filter(str.isdigit, scan_id))
+
+def p_projections_dir(pid, sid):
+    return BASE_DIR / pid / "CBCT projections" / sid / "projections"
+
+def p_xml(pid, sid):
+    return BASE_DIR / pid / "CBCT projections" / sid / "_Frames.xml"
+
+def p_coco(pid, sid, lead):
+    return BASE_DIR / pid / "CBCT projections" / sid / "image_save" / f"{pid}_{sid}_coco_{lead}.json"
+
+def p_annotation_csv(pid, sid, lead):
+    return ANNOT_DIR / f"annotation_center_position_{pid}_CBCT{_scan_num(sid)}_offset_{lead}.csv"
+
+def p_index_csv(pid, sid):
+    return PROJ_DIR / f"{pid}_{sid}_index_{YEAR_TAG}.csv"
+
+def p_small_coco(pid, sid, lead):
+    return SMALL_DIR / f"{pid}_CBCT{_scan_num(sid)}_small_coco_{lead}.json"
+
+def p_centroid_csv(pid, sid, lead):
+    return SMALL_DIR / f"{pid}_CBCT{_scan_num(sid)}_centroids_{lead}.csv"
+
+def p_plot(pid, sid):
+    patient_num = "".join(filter(str.isdigit, pid))
+    return PLOT_DIR / f"plot_{pid}_CBCT{_scan_num(sid)}.png"
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SHARED UTILITIES
+# ══════════════════════════════════════════════════════════════════════════════
+def load_xml_frames(xml_file: Path) -> dict:
+    doc      = minidom.parse(str(xml_file))
+    packages = doc.getElementsByTagName("Frames")
+    sample   = len(doc.getElementsByTagName("UCentre"))
+
+    timestamps, u_centres, v_centres, gantry_angles = [], [], [], []
+    for package in packages:
+        def _get(tag, i):
+            return float(package.getElementsByTagName(tag)[i].childNodes[0].data)
+        for i in range(sample):
+            timestamps.append(_get("DeltaMs", i) / 1000.0)
+            u_centres.append(_get("UCentre", i))
+            v_centres.append(_get("VCentre", i))
+            gantry_angles.append(_get("GantryAngle", i))
+
+    return {
+        "sample": sample, "timestamp": timestamps,
+        "UCentre": u_centres, "VCentre": v_centres, "angle": gantry_angles,
+    }
+
+
+def readhis(filepath):
+    with open(filepath, "rb") as f:
+        f.seek(100)
+        data = []
+        byte = f.read(2)
+        while byte:
+            data.append(struct.unpack("<H", byte)[0])
+            byte = f.read(2)
+            if len(byte) != 2:
+                break
+    return np.array(data).reshape((IMAGE_SIZE, IMAGE_SIZE))
+
+
+def change_coordinate(x, y, z):
+    return [x, z, -y]
+
+
+def convert_3d_to_2d(gantry_angle, X, Y, Z, offsetX, offsetY):
+    pxLen    = accelerator.PixelLengthAtDetector
+    SID, SAD = accelerator.SID, accelerator.SAD
+    xC, yC   = accelerator.XCenterPixel, accelerator.YCenterPixel
+
+    angle_rad        = gantry_angle * np.pi / 180.0
+    cos_a, sin_a     = np.cos(angle_rad), np.sin(angle_rad)
+
+    X_img =  X * cos_a - Z * sin_a
+    Y_img =  Y
+    Z_img =  X * sin_a + Z * cos_a
+
+    scale  = SID / (SAD - Z_img)
+    X_img *= scale
+    Y_img *= scale
+
+    Xp =  X_img / pxLen + xC + offsetX / pxLen
+    Yp = -Y_img / pxLen + yC + offsetY / pxLen
+    return Xp, Yp
+
+
+def clamp_crop(px, py):
+    """Return top-left corner of the 70×70 crop, clamped inside the image."""
+    cx = int(np.clip(px,         HALF_CROP, IMAGE_SIZE - HALF_CROP))
+    cy = int(np.clip(py - SHIFT, HALF_CROP, IMAGE_SIZE - HALF_CROP))
+    return cx, cy
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PART 1 — Centre-of-mass CSV from COCO annotations
+# ══════════════════════════════════════════════════════════════════════════════
+def calculate_annotation_centroid(cfg: dict, frames: dict):
+    pid, sid = cfg["patient_id"], cfg["scan_id"]
+    n        = frames["sample"]
+
+    for lead in cfg["leads"]:
+        coco_path = p_coco(pid, sid, lead)
+        if not coco_path.exists():
+            print(f"    [P1] ⚠  {lead} — COCO not found: {coco_path.name}")
+            continue
+
+        with open(coco_path, encoding="utf-8") as f:
+            data = json.load(f)
+
+        mass_x = np.full(n, np.nan)
+        mass_y = np.full(n, np.nan)
+        for ann in data["annotations"]:
+            coords = ann["segmentation"][0]
+            i      = ann["image_id"] - 1
+            if 0 <= i < n:
+                mass_x[i] = np.mean(coords[0::2])
+                mass_y[i] = np.mean(coords[1::2])
+
+        out = p_annotation_csv(pid, sid, lead)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame({
+            "Timestamp":       frames["timestamp"],
+            "PosX":            mass_x,
+            "PosY":            mass_y,
+            "ElektaKVOffsetX": frames["UCentre"],
+            "ElektaKVOffsetY": frames["VCentre"],
+            "Gantry":          frames["angle"],
+        }).to_csv(out, index=False)
+        print(f"    [P1] ✓  {lead:6s} → {out.name}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PART 2 — Projected index CSV (3D → 2D per frame)
+# ══════════════════════════════════════════════════════════════════════════════
+def generate_projected_indices(cfg: dict, frames: dict) -> "pd.DataFrame | None":
+    """Returns the index DataFrame so Part 3 can reuse it without re-reading."""
+    pid, sid = cfg["patient_id"], cfg["scan_id"]
+
+    if cfg["point"] is None or cfg["isocenter"] is None:
+        print(f"    [P2] ⚠  No 3D point defined — skipping projection")
+        return None
+
+    images_dir = p_projections_dir(pid, sid)
+    if not images_dir.exists():
+        print(f"    [P2] ⚠  Projections dir not found: {images_dir}")
+        return None
+
+    dx, dy, dz = (cfg["point"][i] - cfg["isocenter"][i] for i in range(3))
+    coords     = change_coordinate(dx, dy, dz)
+    coords_iso = change_coordinate(0, 0, 0)
+
+    n        = frames["sample"]
+    time_arr = np.full(n, np.nan);  angle_arr = np.full(n, np.nan)
+    index_x  = np.full(n, np.nan);  index_y   = np.full(n, np.nan)
+    proj_x   = np.full(n, np.nan);  proj_y    = np.full(n, np.nan)
+    iso_x    = np.full(n, np.nan);  iso_y     = np.full(n, np.nan)
+    offX_arr = np.full(n, np.nan);  offY_arr  = np.full(n, np.nan)
+
+    filenames = sorted(os.listdir(images_dir))
+    for idx, filename in enumerate(filenames):
+        if idx >= n:
+            break
+        angle   = frames["angle"][idx] - 90
+        offsetX = frames["UCentre"][idx]
+        offsetY = frames["VCentre"][idx]
+
+        p2d     = convert_3d_to_2d(angle + 90, coords[0],     coords[1],     coords[2],     offsetX, offsetY)
+        p2d_iso = convert_3d_to_2d(angle + 90, coords_iso[0], coords_iso[1], coords_iso[2], offsetX, offsetY)
+
+        cx, cy = clamp_crop(p2d[0], p2d[1])
+
+        time_arr[idx]  = frames["timestamp"][idx]
+        angle_arr[idx] = angle
+        offX_arr[idx]  = offsetX
+        offY_arr[idx]  = offsetY
+        proj_x[idx]    = p2d[0]
+        proj_y[idx]    = p2d[1] - SHIFT
+        index_x[idx]   = cx
+        index_y[idx]   = cy
+        iso_x[idx]     = p2d_iso[0]
+        iso_y[idx]     = p2d_iso[1]
+
+    df = pd.DataFrame({
+        "Timestamp":       time_arr,  "indexx":          index_x,
+        "indexy":          index_y,   "project_x":       proj_x,
+        "project_y":       proj_y,    "iso_x":           iso_x,
+        "iso_y":           iso_y,     "Gantry":          angle_arr,
+        "ElektaKVOffsetX": offX_arr,  "ElektaKVOffsetY": offY_arr,
+    })
+
+    out = p_index_csv(pid, sid)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out, index=False)
+    print(f"    [P2] ✓  index → {out.name}  ({n} frames)")
+    return df
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PART 3 — Convert full-image COCO → small-image COCO
+# ══════════════════════════════════════════════════════════════════════════════
+def convert_coco_full_to_small(cfg: dict, index_df: pd.DataFrame):
+    pid, sid = cfg["patient_id"], cfg["scan_id"]
+
+    crop_ox = index_df["indexx"].values   # top-left x (already clamped)
+    crop_oy = index_df["indexy"].values   # top-left y (already clamped)
+    n       = len(crop_ox)
+
+    for lead in cfg["leads"]:
+        coco_path = p_coco(pid, sid, lead)
+        if not coco_path.exists():
+            print(f"    [P3] ⚠  {lead} — COCO not found: {coco_path.name}")
+            continue
+
+        with open(coco_path, encoding="utf-8") as f:
+            data_raw = json.load(f)
+
+        centroid_x = np.full(n, np.nan)
+        centroid_y = np.full(n, np.nan)
+
+        for ann in data_raw["annotations"]:
+            fi = ann["image_id"] - 1
+            if fi < 0 or fi >= n:
+                continue
+
+            ox, oy  = crop_ox[fi], crop_oy[fi]
+            coords   = ann["segmentation"][0]
+            offsets  = [ox if k % 2 == 0 else oy for k in range(len(coords))]
+            small_coords = [c - o for c, o in zip(coords, offsets)]
+
+            bbox = ann["bbox"]
+            ann["segmentation"][0] = small_coords
+            ann["bbox"]            = [bbox[0] - ox, bbox[1] - oy, bbox[2], bbox[3]]
+
+            centroid_x[fi] = np.mean(small_coords[0::2])
+            centroid_y[fi] = np.mean(small_coords[1::2])
+
+        out_json = p_small_coco(pid, sid, lead)
+        out_csv  = p_centroid_csv(pid, sid, lead)
+        out_json.parent.mkdir(parents=True, exist_ok=True)
+
+        with open(out_json, "w", encoding="utf-8") as f:
+            json.dump(data_raw, f)
+
+        pd.DataFrame({
+            "frame":      np.arange(n),  "centroid_x": centroid_x,
+            "centroid_y": centroid_y,    "crop_ox":    crop_ox,
+            "crop_oy":    crop_oy,
+        }).to_csv(out_csv, index=False)
+
+        print(f"    [P3] ✓  {lead:6s} → {out_json.name}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PART 4 — Plot PosX / PosY vs Timestamp for all leads in a scan
+# ══════════════════════════════════════════════════════════════════════════════
+def visualize_2d_annotations(cfg: dict, index1: int = 0, index2: int = 1000):
+    """
+    Read the Part-1 annotation CSVs and plot PosX / PosY vs Timestamp.
+    Saves one PNG per scan to PLOT_DIR.
+    """
+    pid, sid = cfg["patient_id"], cfg["scan_id"]
+
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(7, 5), sharex=True)
+    fig.suptitle(f"{pid}  {sid}", fontsize=13, fontweight="bold")
+
+    any_plotted = False
+
+    for lead in cfg["leads"]:
+        csv_path = p_annotation_csv(pid, sid, lead)
+        if not csv_path.exists():
+            print(f"    [P4] ⚠  {lead} — annotation CSV not found: {csv_path.name}")
+            continue
+
+        df  = pd.read_csv(csv_path)
+        slc = df.iloc[index1:index2]
+
+        valid_x = slc["PosX"].dropna()
+        valid_y = slc["PosY"].dropna()
+        if valid_x.empty and valid_y.empty:
+            print(f"    [P4] ⚠  {lead} — no annotated frames in slice [{index1}:{index2}]")
+            continue
+
+        rng_x = valid_x.max() - valid_x.min()
+        rng_y = valid_y.max() - valid_y.min()
+        print(f"    [P4] {lead}: ΔX={rng_x:.1f}  ΔY={rng_y:.1f}  pixels")
+
+        # Resolve colour: try exact suffix first, then lead type (e.g. "RV")
+        lead_type = lead.split("_")[0]
+        color     = LEAD_COLORS.get(lead, LEAD_COLORS.get(lead_type, "grey"))
+
+        t  = slc["Timestamp"].values.astype(float)
+        px = slc["PosX"].values.astype(float)
+        py = slc["PosY"].values.astype(float)
+
+        # Insert NaN at time gaps so matplotlib draws a break, not a dash
+        dt  = np.diff(t)
+        gap = dt > 2 * np.nanmedian(dt[~np.isnan(dt)])
+        for gi in np.where(gap)[0]:
+            px[gi + 1] = np.nan
+            py[gi + 1] = np.nan
+
+        ax1.plot(t, px, color=color, label=lead)
+        ax2.plot(t, py, color=color, label=lead)
+        any_plotted = True
+
+    if not any_plotted:
+        print(f"    [P4] ✗  Nothing to plot for {pid} {sid}")
+        plt.close(fig)
+        return
+
+    # ── Axes styling ──────────────────────────────────────────────────────────
+    for ax in (ax1, ax2):
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.tick_params(axis="both", labelsize=12)
+
+    ax1.spines["bottom"].set_visible(False)
+    ax1.set_ylabel("PosX (pixels)", fontsize=13)
+    ax1.legend(bbox_to_anchor=(0.95, 0.8), fontsize=11, framealpha=0.1)
+
+    ax2.set_xlabel("Time (sec)", fontsize=14)
+    ax2.set_ylabel("PosY (pixels)", fontsize=13)
+
+    plt.tight_layout()
+
+    out = p_plot(pid, sid)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"    [P4] ✓  plot → {out.name}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ══════════════════════════════════════════════════════════════════════════════
+def process(cfg: dict, plot_index1: int = 0, plot_index2: int = 1000):
+    pid, sid = cfg["patient_id"], cfg["scan_id"]
+    print(f"\n{'═'*60}")
+    print(f"  {pid}  |  {sid}  |  leads: {', '.join(cfg['leads'])}")
+    print(f"{'═'*60}")
+
+    xml_file = p_xml(pid, sid)
+    if not xml_file.exists():
+        print(f"  ⚠  XML not found — skipping entire scan: {xml_file}")
+        return
+
+    # Load XML once — shared across Parts 1, 2, 3
+    frames = load_xml_frames(xml_file)
+    print(f"  XML loaded — {frames['sample']} frames")
+
+    calculate_annotation_centroid(cfg, frames)
+
+    index_df =generate_projected_indices(cfg, frames)
+
+    # Part 3 needs the index CSV; fall back to reading it if Part 2 was skipped
+    if index_df is None:
+        idx_path = p_index_csv(pid, sid)
+        if idx_path.exists():
+            index_df = pd.read_csv(idx_path)
+            print(f"    [P3] ℹ  Using existing index CSV: {idx_path.name}")
+        else:
+            print(f"    [P3] ⚠  No index available — skipping coordinate conversion")
+            index_df = None
+
+    if index_df is not None:
+        convert_coco_full_to_small(cfg, index_df)
+
+    # Part 4 reads Part-1 output CSVs — always runs if they exist
+    visualize_2d_annotations(cfg, index1=plot_index1, index2=plot_index2)
+
+
+def main(plot_index1: int = 0, plot_index2: int = 1000):
+    for d in [ANNOT_DIR, SMALL_DIR, PROJ_DIR, PLOT_DIR]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    print(f"Pipeline: {len(CONFIGS)} scan(s)\n")
+    for cfg in CONFIGS:
+        try:
+            process(cfg, plot_index1=plot_index1, plot_index2=plot_index2)
+        except Exception as e:
+            print(f"  ✗  {cfg['patient_id']} {cfg['scan_id']}: {e}")
+
+    print("\nAll done.")
+
+
+if __name__ == "__main__":
+    # Optionally override the frame slice for plots here:
+    main(plot_index1=0, plot_index2=1000)
