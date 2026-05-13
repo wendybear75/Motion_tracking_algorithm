@@ -1,0 +1,168 @@
+import os
+import re
+import math
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+INPUT_FOLDER  = r"C:/Users/E123502/OneDrive - RMIT University/REVENTA data/3D estimation/manual_batch_output"
+OUTPUT_FOLDER = r"C:/Users/E123502/OneDrive - RMIT University/REVENTA data/3D estimation/displacement_results"
+
+
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+# ── Helper: extract patient ID and lead name from filename ────────────────────
+# Expects filenames like: cOutput_P11_CBCT2_manual_RA.txt
+#                         cOutput_P7_CBCT1_manual_middle_Jan_2025.txt
+def parse_filename(stem):
+    """
+    Returns (patient_id, lead_name) extracted from the file stem.
+
+    Handles both formats:
+      old: "cOutput_P11_CBCT2_manual_RA"                               -> ("P11",    "RA")
+      new: "cOutput_annotation_center_position_SYD001_CBCT1_offset_RA" -> ("SYD001", "RA")
+
+    Rules:
+      - patient_id: first token that is letters followed by digits (e.g. P11, SYD001)
+      - lead_name:  always the last underscore-separated token in the stem (e.g. RA, LV)
+    """
+    # patient ID: one or more letters immediately followed by one or more digits
+    patient_match = re.search(r'([A-Za-z]+\d+)', stem)
+    patient_id = patient_match.group(1) if patient_match else "unknown"
+
+    # lead name: known lead codes (RV, LV, PV, RA, LA) optionally followed by _1, _2 etc.
+    lead_match = re.search(r'(RV|LV|PV|RA|LA)(_\d+)?', stem)
+    lead_name = lead_match.group(0) if lead_match else stem.rsplit('_', 1)[-1]
+
+    return patient_id, lead_name
+
+
+# ── Collect all results into one summary DataFrame ────────────────────────────
+all_results = []
+
+txt_files = sorted(f for f in os.listdir(INPUT_FOLDER) if f.startswith("cOutput_") and f.endswith(".txt"))
+
+if not txt_files:
+    print(f"No cOutput_*.txt files found in: {INPUT_FOLDER}")
+else:
+    print(f"Found {len(txt_files)} file(s) to process.\n")
+
+for filename in txt_files:
+    filepath = os.path.join(INPUT_FOLDER, filename)
+    stem = os.path.splitext(filename)[0]
+    patient_id, lead_name = parse_filename(stem)
+
+    print(f"Processing: {filename}  ->  patient={patient_id}, lead={lead_name}")
+
+    # ── load data ─────────────────────────────────────────────────────────────
+    try:
+        data = np.loadtxt(filepath, skiprows=1, delimiter=",")
+    except Exception as e:
+        print(f"  ERROR loading file: {e}\n")
+        continue
+
+    if data.ndim < 2 or data.shape[0] == 0:
+        print("  WARNING: empty or malformed file — skipping.\n")
+        continue
+
+    times      = data[:, 1]
+    estimate_X = data[:, 4]
+    estimate_Y = data[:, 5]
+    estimate_Z = data[:, 6]
+    gantry     = [item - 90 for item in data[:, 0]]
+
+    df = pd.DataFrame({
+        'TIME':       times,
+        'Gantry':     gantry,
+        'estimate_X': estimate_X,
+        'estimate_Y': estimate_Y,
+        'estimate_Z': estimate_Z,
+    })
+
+    # ── compute displacement from mean ────────────────────────────────────────
+    xmean = df['estimate_X'].mean()
+    ymean = df['estimate_Y'].mean()
+    zmean = df['estimate_Z'].mean()
+
+    height_X = np.abs(np.array(list(filter(lambda x: not math.isnan(x), estimate_X))) - xmean)
+    height_Y = np.abs(np.array(list(filter(lambda x: not math.isnan(x), estimate_Y))) - ymean)
+    height_Z = np.abs(np.array(list(filter(lambda x: not math.isnan(x), estimate_Z))) - zmean)
+
+    # ── save per-patient displacement CSV ─────────────────────────────────────
+    df_displacement = pd.DataFrame({
+        'patient':   patient_id,
+        'lead':      lead_name,
+        'direction': ['LR'] * len(height_X) + ['SI'] * len(height_Y) + ['AP'] * len(height_Z),
+        'values':    height_X.tolist() + height_Y.tolist() + height_Z.tolist(),
+    })
+
+    out_csv = os.path.join(OUTPUT_FOLDER, f"displacement_{patient_id}_{lead_name}.csv")
+    df_displacement.to_csv(out_csv, index=False)
+    print(f"  -> Saved displacement CSV: {out_csv}")
+
+    # ── save plot — insert NaN at time gaps so matplotlib leaves them blank ───
+    # A gap is defined as a time jump > 3x the median time step
+    df_plot = df.copy().reset_index(drop=True)
+    dt = df_plot['TIME'].diff()
+    gap_threshold = dt.median() * 3
+    gap_indices = dt[dt > gap_threshold].index
+
+    # Insert a NaN row before each gap index so the line breaks
+    nan_row = pd.DataFrame([[np.nan] * len(df_plot.columns)], columns=df_plot.columns)
+    for idx in sorted(gap_indices, reverse=True):
+        df_plot = pd.concat([df_plot.iloc[:idx], nan_row, df_plot.iloc[idx:]], ignore_index=True)
+
+    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(6, 4))
+
+    t = df_plot['TIME'].values
+    X = np.ma.masked_invalid(df_plot['estimate_X'].values)
+    Y = np.ma.masked_invalid(df_plot['estimate_Y'].values)
+    Z = np.ma.masked_invalid(df_plot['estimate_Z'].values)
+
+    ax1.plot(t, X, c='grey', label='LR')
+    ax1.spines['top'].set_visible(False)
+    ax1.spines['right'].set_visible(False)
+    ax1.spines['bottom'].set_visible(False)
+    ax1.set_xticks([])
+    ax1.legend(bbox_to_anchor=(0.95, 0.9), fontsize=10)
+    ax1.tick_params(axis='y', labelsize=12)
+
+    ax2.plot(t, Y, c='grey', label='SI')
+    ax2.spines['top'].set_visible(False)
+    ax2.spines['right'].set_visible(False)
+    ax2.spines['bottom'].set_visible(False)
+    ax2.set_xticks([])
+    ax2.legend(bbox_to_anchor=(0.95, 0.9), fontsize=10)
+    ax2.tick_params(axis='y', labelsize=12)
+
+    ax3.plot(t, Z, c='grey', label='AP')
+    ax3.legend(bbox_to_anchor=(0.95, 0.9), fontsize=10)
+    ax3.set_xlabel('Time (second)', fontsize=12)
+    ax3.spines['top'].set_visible(False)
+    ax3.spines['right'].set_visible(False)
+    ax3.tick_params(axis='x', labelsize=12)
+    ax3.tick_params(axis='y', labelsize=12)
+
+    ax2.set_ylabel('3D position (mm)', fontsize=12)
+    ax1.set_title(f'ICD lead tip trace — {patient_id} {lead_name}', fontsize=14, fontweight='bold')
+
+    plt.tight_layout()
+    out_plot = os.path.join(OUTPUT_FOLDER, f"plot_{patient_id}_{lead_name}.png")
+    plt.savefig(out_plot, dpi=150)
+    plt.close()
+    print(f"  -> Saved plot        : {out_plot}\n")
+
+    # ── accumulate into summary ───────────────────────────────────────────────
+    all_results.append(df_displacement)
+
+# ── save combined summary CSV with all patients and leads ─────────────────────
+if all_results:
+    df_all = pd.concat(all_results, ignore_index=True)
+    summary_path = os.path.join(OUTPUT_FOLDER, "displacement_all_patients.csv")
+    df_all.to_csv(summary_path, index=False)
+    print(f"Summary saved: {summary_path}")
+
+
+
